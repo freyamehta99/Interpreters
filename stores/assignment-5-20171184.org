@@ -1,0 +1,327 @@
+#+TITLE: The Stores Language
+#+AUTHOR: Freya Mehta
+
+* Environment
+
+Because the parser defines a bind's value to be AST, I am defining a
+new bind type =VBind= that has =Value= type as it's value.  This
+allows having closures in the environment without modifying the =AST=
+type.
+
+
+#+name: vbind
+#+BEGIN_SRC haskell
+  data VBind = VBind ID Value deriving (Show)
+
+  b2vb :: Binding -> [VBind] -> Store -> (VBind, Store)
+  b2vb bind env store =
+    case bind of (Bind id (Boolean b)) -> ((VBind id (Booleric b)), store)
+		 (Bind id (Number n)) -> ((VBind id (Numeric n)), store)
+		 (Bind id (Function formals body)) -> ((VBind id (Proc formals body env)), store)
+                 (Bind id ast) -> 
+		   let (v, store') = eval env store ast
+		   in ((VBind id v), store')
+#+END_SRC
+
+* Semantic Domains
+
+
+Expressible and denotable values now include =references= along with
+numeric, boolean and procedure data types.
+
+#+name: values
+#+BEGIN_SRC haskell
+  data Value = NullVal
+    | Numeric Int
+    | Booleric Bool
+    | Proc [ID] AST [VBind]
+    deriving (Show)
+#+END_SRC
+
+* Evaluator
+** Env Lookup and Extend
+
+#+name: env-funcs
+#+BEGIN_SRC haskell 
+  lookupEnv :: [VBind] -> ID -> Value
+  lookupEnv env id =
+    (\(VBind i v) -> v) $ head $ filter (\(VBind i v) -> i == id) env
+
+
+  -- evaluate each value in the bindings, and return the simplified
+  -- bindings along with the new store
+  elaborate :: [Binding] -> [VBind] -> Store -> ([VBind], Store)
+  elaborate [] env store = (env, store)
+  elaborate [b] env store = 
+    let (vb, store') = b2vb b env store
+    in  ([vb], store')
+  elaborate (b:b') env store = 
+    let (vb, store') = b2vb b env store
+    in
+      let (vb', store'') = elaborate b' env store'
+      in ((vb:vb'), store'')
+
+
+  extendEnv :: [VBind] -> [Binding] -> Store -> ([VBind], Store)
+  extendEnv env binds store =
+      -- take a binding, convert it to vbind
+      let (vbinds, store') = elaborate binds env store
+      in 
+        let vb' = List.unionBy (\(VBind i v) (VBind j v') -> i == j) env vbinds
+	in (vb', store')
+#+END_SRC
+
+** Eval If Then Else
+
+#+name: eval-if-exp
+#+BEGIN_SRC haskell
+  evalifexp :: [VBind] -> Store -> AST -> AST -> AST -> (Value, Store)
+  evalifexp env store ia ta ea =
+    let (t, store') = eval env store ia
+    in
+      case t of (Booleric b) ->
+		  if b then (eval env store' ta) else (eval env store' ea)
+		_ -> error "Unexpected value!"
+                  
+#+END_SRC
+
+** Eval Operators
+#+name: eval-ops
+#+BEGIN_SRC haskell
+
+  valueOfn (Numeric n) = n
+  valueOfb (Booleric b) = b
+
+  numBop :: ID -> Int -> Int -> Value
+  numBop op v v'
+    | op == "+" = Numeric (v + v')
+    | op == "-" = Numeric (v - v')
+    | op == "*" = Numeric (v * v')
+    | op == "/" = Numeric (div v v')
+
+
+  boolBop :: ID -> Bool -> Bool -> Value
+  boolBop op v v'
+    | op == "|" = Booleric (v || v')
+    | op == "&" = Booleric (v && v')
+
+  boolUop :: ID -> Bool -> Value
+  boolUop op v
+    | op == "~" = Booleric (not v)
+
+  numUop :: ID -> Int -> Value
+  numUop op v
+    | op == "zero?" = Booleric $ if v == 0 then True else False
+
+  evalOp :: [VBind] -> Store -> ID -> [AST] -> (Value, Store)
+  evalOp env store op args
+    | elem op ["+", "-", "*", "/"] =
+        let (v1, store') = eval env store (args!!0)
+	in
+	  let v1' = valueOfn v1
+	      (v2, store'') = eval env store' (args!!1)
+	  in
+	      let v2' = valueOfn v2
+	      in (numBop op v1' v2', store'')
+    | elem op ["|", "&"] = 
+        let (v1, store') = eval env store (args!!0)
+	in
+	  let v1' = valueOfb v1
+	      (v2, store'') = eval env store' (args!!1)
+	  in
+	      let v2' = valueOfb v2
+	      in (boolBop op v1' v2', store'')
+    | op == "~" = 
+        let (v, store') = eval env store (args!!0)
+	in
+	    (boolUop op (valueOfb v), store')
+    | op == "zero?" = 
+        let (v, store') = eval env store (args!!0)
+	in
+	    (numUop op (valueOfn v), store')
+    | otherwise = error "op error."
+
+#+END_SRC
+** Eval Application
+
+#+name: apply
+#+BEGIN_SRC haskell
+
+  isop :: ID -> Bool
+  isop id = elem id ["+", "-", "*", "/", "|", "&", "~"]
+
+  isufun :: [VBind] -> ID -> Bool
+  isufun env id =
+    case (lookupEnv env id) of
+        (Proc i a e) -> True
+	_ -> False
+
+
+  applyufun :: [VBind] -> Store -> ID -> [AST] -> (Value, Store)
+  applyufun env store id args =
+    let (Proc formals body senv) = lookupEnv env id
+    in
+      let minienv = (List.zipWith (\i a -> (Bind i a)) formals args)
+      in 
+        let (env', store') = extendEnv senv minienv store
+	in 
+	    eval env' store' body
+
+
+  apply :: [VBind] -> Store -> ID -> [AST] -> (Value, Store)
+  apply env store id args
+    | isop id = evalOp env store id args
+    | (isufun env id) = applyufun env store id args
+    | otherwise = error "invalid application."
+
+			       
+#+END_SRC
+** Eval Sequence
+
+#+name: eval-seq
+#+BEGIN_SRC haskell
+  evalSeq :: [AST] -> [VBind] -> Store -> (Value, Store)
+  evalSeq [ast] env store =
+    eval env store ast
+  evalSeq (ast:alist') env store =  
+    let (v, store') = eval env store ast
+    in
+      evalSeq alist' env store'
+#+END_SRC
+** Eval
+
+=eval= function takes an =env=, a =store= and the =AST= to be
+evaluated; and returns the =value= along with the updated =store=.
+
+Since =lookupEnv= does not perform any evaluation in this
+implementation, it does not need to know about the store and hence
+remains unchanged.
+
+What about =extendEnv= =extendEnv= calls for =b2vb=, which performs
+/elaboration/, so it may update the state.  Therefore we need to pass
+the store, and as a result, the definition of =assume=, =extendEnv=
+and =b2vb= will change.
+
+
+
+#+name: eval
+#+BEGIN_SRC haskell
+  eval :: [VBind] -> Store -> AST -> (Value, Store)
+  eval env store ast =
+    case ast of (Number n) ->
+		  ((Numeric n), store)
+		(Boolean b) ->
+		  ((Booleric b), store)
+		(Reference id) ->
+		  (lookupEnv env id, store)
+		(Assume bindings ast) ->
+		  let (env', store')  = extendEnv env bindings store
+		  in eval env' store' ast
+		(If i t e) -> evalifexp env store i t e
+		(App ((Reference id): args)) -> apply env store id args
+		(NewRef id) -> 
+		  let (id', store') = eval env store id
+		  in
+		    (NullVal, newRef store' (valueOfn id'))
+		(SetRef id val) -> 
+		  let (val', store') = eval env store val
+		  in
+		      let (id', store'') = eval env store' id
+		      in  (val', setRef store'' (valueOfn id') val')
+		(DeRef id) ->
+		  let (id', store') = eval env store id
+		  in
+		    let v = deRef store (valueOfn id')
+		    in (v, store')
+		(Sequence alist) ->
+		  evalSeq alist env store
+		  
+		_ -> error "unexpected!"
+
+  eval' :: [Binding] -> AST -> Value
+  eval' env ast =
+    let
+      store = newStore
+    in
+      let 
+        (env', store') = extendEnv [] env store
+      in
+        let (v,s) = eval env' store' ast
+        in v
+#+END_SRC
+
+
+* Stores
+
+** Store type
+
+#+NAME: store-type
+#+BEGIN_SRC haskell
+  type StoreRef = Int  
+  type Store = Map.Map StoreRef Value
+#+END_SRC
+
+** New Empty Store
+
+#+NAME: new-store
+#+BEGIN_SRC haskell
+  newStore :: Store
+  newStore = Map.empty
+#+END_SRC
+
+** New Reference
+
+newRef takes a store and a reference and returns a new store which
+is same as the previous store, with a new reference refering to a
+null value.
+
+#+NAME: new-ref
+#+BEGIN_SRC haskell
+  newRef :: Store -> StoreRef -> Store
+  newRef store ref = Map.insert ref NullVal store
+#+END_SRC
+
+** Set Reference
+
+setRef updates the value of an exising reference in the store
+
+#+NAME: set-ref
+#+BEGIN_SRC haskell
+setRef :: Store -> StoreRef -> Value -> Store
+setRef store ref val = Map.insert ref val store
+#+END_SRC
+
+** DeReference
+
+deRef returns the value of an existing ref in the store
+
+#+NAME: deref
+#+BEGIN_SRC haskell
+deRef :: Store -> StoreRef -> Value
+deRef store ref =
+  let v = Map.lookup ref store
+  in case v of Just n -> n
+               Nothing -> error "variable not found"
+#+END_SRC
+
+
+* Tangle
+#+BEGIN_SRC haskell :eval no :noweb yes :tangle interpreter01.hs
+  import ASTParser
+  import Data.List as List
+  import qualified Data.Map as Map
+  <<values>>
+  <<store-type>>
+  <<new-store>>
+  <<new-ref>>
+  <<set-ref>>
+  <<deref>>
+  <<vbind>>
+  <<eval-seq>>
+  <<eval>>
+  <<eval-if-exp>>
+  <<eval-ops>>
+  <<env-funcs>>
+  <<apply>>
+  run = ((eval' []) . parseString)
+#+END_SRC
